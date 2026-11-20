@@ -23,17 +23,16 @@ pub enum OccCommitResult {
 }
 
 #[derive(Debug)]
-pub struct OccCommitter<'a> {
-    versioned_storage: &'a mut VersionedStore,
-}
+pub struct OccCommitter;
 
-impl<'a> OccCommitter<'a> {
-    pub fn new(versioned_storage: &'a mut VersionedStore) -> Self {
-        Self { versioned_storage }
+impl OccCommitter {
+    pub fn new() -> Self {
+        Self {}
     }
 
-    pub fn commit(
+    pub fn commit<'a>(
         &mut self,
+        versioned_storage: &mut VersionedStore,
         read_set: HashMap<String, (&'a u64, &'a String)>,
         write_set: HashMap<String, (String, u64)>,
     ) -> OccCommitResult {
@@ -56,7 +55,7 @@ impl<'a> OccCommitter<'a> {
 
         // W/W Validation
         for (key, (val, ts)) in &write_set {
-            if let Some(stored_ts) = self.versioned_storage.get_max_timestamp_for_record(&key) {
+            if let Some(stored_ts) = versioned_storage.get_max_timestamp_for_record(&key) {
                 if *stored_ts > *ts {
                     return OccCommitResult::Aborted(AbortStatus {
                         confilict_type: ConflictType::WW,
@@ -70,7 +69,7 @@ impl<'a> OccCommitter<'a> {
         }
         // R/W validation
         for (key, (ts, val)) in read_set {
-            if let Some(stored_ts) = self.versioned_storage.get_max_timestamp_for_record(&key) {
+            if let Some(stored_ts) = versioned_storage.get_max_timestamp_for_record(&key) {
                 if stored_ts >= ts && tx_contains_writes {
                     return OccCommitResult::Aborted(AbortStatus {
                         confilict_type: ConflictType::RW,
@@ -93,7 +92,7 @@ impl<'a> OccCommitter<'a> {
             }
         }
         for (key, (value, ts)) in write_set {
-            self.versioned_storage.put(key, value, ts);
+            versioned_storage.put(key, value, ts);
         }
         OccCommitResult::Comitted
     }
@@ -112,7 +111,7 @@ mod test {
     #[test]
     pub fn test_non_existing_key() {
         let mut versioned_storage = VersionedStore::new();
-        let mut occ_comitter = OccCommitter::new(&mut versioned_storage);
+        let mut occ_comitter = OccCommitter::new();
 
         let key = "1".to_string();
         let val = "1".to_string();
@@ -124,7 +123,7 @@ mod test {
 
         let write_set = HashMap::new();
 
-        let res = occ_comitter.commit(read_set, write_set);
+        let res = occ_comitter.commit(&mut versioned_storage, read_set, write_set);
 
         assert_ne!(res, OccCommitResult::Comitted);
     }
@@ -132,7 +131,7 @@ mod test {
     #[test]
     pub fn test_insert() {
         let mut versioned_storage = VersionedStore::new();
-        let mut occ_comitter = OccCommitter::new(&mut versioned_storage);
+        let mut occ_comitter = OccCommitter::new();
 
         let key = "1".to_string();
         let val = "1".to_string();
@@ -144,7 +143,7 @@ mod test {
         // updates
         let mut write_set: HashMap<String, (String, u64)> = HashMap::new();
         write_set.insert(key, (val, ts));
-        let res = occ_comitter.commit(read_set, write_set);
+        let res = occ_comitter.commit(&mut versioned_storage, read_set, write_set);
 
         assert_eq!(res, OccCommitResult::Comitted);
     }
@@ -155,7 +154,7 @@ mod test {
     pub fn test_snapshot_reads() {
         let mut versioned_storage = VersionedStore::new();
         populate_store_with_multiple_versions(&mut versioned_storage, 1, 10, 10);
-        let mut occ_comitter = OccCommitter::new(&mut versioned_storage);
+        let mut occ_comitter = OccCommitter::new();
 
         let key = "1".to_string();
         let val = "1".to_string();
@@ -166,7 +165,7 @@ mod test {
 
         let write_set = HashMap::new();
 
-        let commit_result = occ_comitter.commit(read_set, write_set);
+        let commit_result = occ_comitter.commit(&mut versioned_storage, read_set, write_set);
         assert_eq!(commit_result, OccCommitResult::Comitted);
     }
 
@@ -174,7 +173,7 @@ mod test {
     pub fn test_conflict_on_read_set() {
         let mut versioned_storage = VersionedStore::new();
         populate_store_with_multiple_versions(&mut versioned_storage, 1, 10, 10);
-        let mut occ_comitter = OccCommitter::new(&mut versioned_storage);
+        let mut occ_comitter = OccCommitter::new();
 
         let key = "1".to_string();
         let val = "1".to_string();
@@ -186,7 +185,7 @@ mod test {
         let mut write_set: HashMap<String, (String, u64)> = HashMap::new();
         write_set.insert("11".to_string(), ("11".to_string(), 11));
 
-        let commit_result = occ_comitter.commit(read_set, write_set);
+        let commit_result = occ_comitter.commit(&mut versioned_storage, read_set, write_set);
 
         assert_ne!(commit_result, OccCommitResult::Comitted);
     }
@@ -196,7 +195,7 @@ mod test {
         let mut versioned_storage = VersionedStore::new();
         let max_ts = 10;
         populate_store_with_multiple_versions(&mut versioned_storage, 1, 10, max_ts);
-        let mut occ_comitter = OccCommitter::new(&mut versioned_storage);
+        let mut occ_comitter = OccCommitter::new();
 
         // tx-1
         let tx_1_r_ts = max_ts + 1;
@@ -217,7 +216,7 @@ mod test {
             let mut write_set: HashMap<String, (String, u64)> = HashMap::new();
             write_set.insert(key1_t1, ("0".to_string(), tx_1_w_ts));
 
-            let commit_result = occ_comitter.commit(read_set, write_set);
+            let commit_result = occ_comitter.commit(&mut versioned_storage, read_set, write_set);
 
             assert_eq!(commit_result, OccCommitResult::Comitted);
         }
@@ -236,7 +235,7 @@ mod test {
             let mut write_set: HashMap<String, (String, u64)> = HashMap::new();
             write_set.insert(key2, ("0".to_string(), tx_2_w_ts));
 
-            let commit_result = occ_comitter.commit(read_set, write_set);
+            let commit_result = occ_comitter.commit(&mut versioned_storage, read_set, write_set);
 
             assert_ne!(commit_result, OccCommitResult::Comitted);
         }

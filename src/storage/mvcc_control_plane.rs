@@ -20,7 +20,7 @@ impl MVCCControlPlane {
 mod test {
     use std::{sync::Arc, thread};
 
-    use crate::storage::mvcc_control_plane::{self, MVCCControlPlane};
+    use crate::storage::mvcc_control_plane::MVCCControlPlane;
 
     #[test]
     pub fn test_ts_increment() {
