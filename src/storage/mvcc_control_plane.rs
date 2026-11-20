@@ -10,7 +10,7 @@ impl MVCCControlPlane {
         Self { current_ts }
     }
 
-    pub fn acquire_ts(&mut self) -> u64 {
+    pub fn acquire_ts(&self) -> u64 {
         let ts = self.current_ts.fetch_add(1, atomic::Ordering::Relaxed);
         ts
     }
@@ -22,7 +22,7 @@ mod test {
 
     #[test]
     pub fn test_ts_increment() {
-        let mut mvcc_control_plane = MVCCControlPlane::new();
+        let mvcc_control_plane = MVCCControlPlane::new();
         for i in 1..100 {
             let ts = mvcc_control_plane.acquire_ts();
             assert_eq!(i, ts)
