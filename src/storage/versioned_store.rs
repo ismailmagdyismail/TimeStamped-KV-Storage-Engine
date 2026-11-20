@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VersionedStore {
     store: HashMap<String, BTreeMap<u64, String>>,
 }
