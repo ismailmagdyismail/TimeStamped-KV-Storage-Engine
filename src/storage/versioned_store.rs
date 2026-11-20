@@ -21,9 +21,10 @@ impl VersionedStore {
         max_ts
     }
 
-    pub fn get(&self, key: &str, timestamp: u64) -> Option<&String> {
+    pub fn get_at_or_before_ts(&self, key: &str, timestamp: u64) -> Option<(&u64, &String)> {
         let versions = self.store.get(key)?;
-        versions.get(&timestamp)
+        let lower_bound_match = versions.range(..=timestamp).next_back();
+        lower_bound_match
     }
 
     pub fn get_latest(&self, key: &str) -> Option<(&u64, &String)> {
@@ -83,8 +84,9 @@ mod tests {
             let key = i.to_string();
             let value = i.to_string();
 
-            let val = store.get(&key, expected_max_timestamp);
-            assert_eq!(val, Some(&value));
+            let val = store.get_at_or_before_ts(&key, expected_max_timestamp);
+            assert!(val.is_some());
+            assert_eq!(val.unwrap().1, &value);
 
             let max_ts = store.get_max_timestamp_for_record(&key);
             assert_eq!(max_ts, Some(&expected_max_timestamp));
@@ -104,8 +106,9 @@ mod tests {
             let key = i.to_string();
             let value = create_versioned_value(&i.to_string(), expected_max_timestamp);
 
-            let val = store.get(&key, expected_max_timestamp);
-            assert_eq!(val, Some(&value));
+            let val = store.get_at_or_before_ts(&key, expected_max_timestamp);
+            assert!(val.is_some());
+            assert_eq!(val.unwrap().1, &value);
 
             let max_ts = store.get_max_timestamp_for_record(&key);
             assert_eq!(max_ts, Some(&expected_max_timestamp));
@@ -170,10 +173,19 @@ mod tests {
 
         populate_store_with_multiple_versions(&mut store, 1, num_records, num_versions);
         validate_store_with_multiple_versions(&store, num_versions, 1, num_records);
-        
-        let num_versions_for_second_batch = 10;
-        populate_store_with_multiple_versions(&mut store, 101, num_records, num_versions_for_second_batch);
-        validate_store_with_multiple_versions(&store, num_versions_for_second_batch, 101, num_records);
 
+        let num_versions_for_second_batch = 10;
+        populate_store_with_multiple_versions(
+            &mut store,
+            101,
+            num_records,
+            num_versions_for_second_batch,
+        );
+        validate_store_with_multiple_versions(
+            &store,
+            num_versions_for_second_batch,
+            101,
+            num_records,
+        );
     }
 }
