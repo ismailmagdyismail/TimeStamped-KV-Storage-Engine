@@ -51,7 +51,10 @@ impl OccCommitter {
         // it can commit even if other transactions has already committed
         // since it is a snapshot only read (no modifications)
         // as we were reading db at time TN
-        let tx_contains_writes = !write_set.is_empty();
+        let tx_is_read_only = write_set.is_empty();
+        if tx_is_read_only {
+            return OccCommitResult::Comitted;
+        }
 
         // W/W Validation
         for (key, (val, ts)) in &write_set {
@@ -70,7 +73,7 @@ impl OccCommitter {
         // R/W validation
         for (key, (ts, val)) in read_set {
             if let Some(stored_ts) = versioned_storage.get_max_timestamp_for_record(&key) {
-                if stored_ts >= ts && tx_contains_writes {
+                if stored_ts >= ts && !tx_is_read_only {
                     return OccCommitResult::Aborted(AbortStatus {
                         confilict_type: ConflictType::RW,
                         key: key.clone(),
@@ -125,7 +128,7 @@ mod test {
 
         let res = occ_comitter.commit(&mut versioned_storage, read_set, write_set);
 
-        assert_ne!(res, OccCommitResult::Comitted);
+        assert_eq!(res, OccCommitResult::Comitted);
     }
 
     #[test]
