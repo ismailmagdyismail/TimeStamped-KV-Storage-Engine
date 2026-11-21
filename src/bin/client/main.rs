@@ -1,38 +1,38 @@
 use tokio::{
+    self,
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
 };
 
-const ADDR: &str = "127.0.0.1:8080";
-
-async fn send_command(command: &str) -> std::io::Result<String> {
-    let mut stream = TcpStream::connect(ADDR).await?;
-    stream.write_all(command.as_bytes()).await?;
-
-    // The server drops the stream after handling one command,
-    // so reading until EOF gets us the whole reply (or nothing).
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).await?;
-    Ok(String::from_utf8_lossy(&response).into_owned())
-}
-
 #[tokio::main]
-async fn main() -> std::io::Result<()> {
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+async fn main() {
+    let addr = "127.0.0.1:8080".to_string();
+    let mut stream = TcpStream::connect(&addr).await.unwrap();
+    println!("connected to {}", addr);
+    println!("commands: get <key> | put <key> <value> | commit | abort");
 
-    while let Some(line) = lines.next_line().await? {
-        let command = line.trim();
-        if command.is_empty() {
+    let mut stdin = BufReader::new(tokio::io::stdin()).lines();
+    let mut buffer = [0u8; 1024];
+
+    // every command gets exactly one reply from the server, so send a command,
+    // wait for its reply, log it and loop again
+    loop {
+        // stdin closed (ctrl+d), dropping the stream closes the connection
+        let line = match stdin.next_line().await.unwrap() {
+            Some(line) => line,
+            None => break,
+        };
+        let line = line.trim();
+        if line.is_empty() {
             continue;
         }
-        if command == "quit" || command == "exit" {
+        stream.write_all(line.as_bytes()).await.unwrap();
+
+        let bytes = stream.read(&mut buffer).await.unwrap();
+        if bytes == 0 {
+            println!("server closed the connection");
             break;
         }
-        match send_command(command).await {
-            Ok(response) if response.is_empty() => println!("(no response)"),
-            Ok(response) => println!("{response}"),
-            Err(e) => eprintln!("error: {e}"),
-        }
+        println!("{}", String::from_utf8_lossy(&buffer[0..bytes]));
     }
-    Ok(())
 }
