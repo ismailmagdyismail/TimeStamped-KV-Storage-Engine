@@ -168,3 +168,117 @@ impl StorageEngine {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::storage::{
+        occ_comitter::{ConflictType, OccCommitResult},
+        storage_engine::StorageEngine,
+    };
+
+    fn single_write(key: &str, value: &str, ts: u64) -> HashMap<String, (String, u64)> {
+        let mut write_set = HashMap::new();
+        write_set.insert(key.to_string(), (value.to_string(), ts));
+        write_set
+    }
+
+    #[test]
+    fn test_read_missing_key_returns_none() {
+        let engine = StorageEngine::new();
+        assert_eq!(engine.read_key(10, "missing"), None);
+    }
+
+    #[test]
+    fn test_commit_publishes_version() {
+        let mut engine = StorageEngine::new();
+        let commit_ts = engine.acquire_ts();
+
+        let result: OccCommitResult =
+            engine.commit(HashMap::new(), single_write("k", "v1", commit_ts));
+        assert_eq!(result, OccCommitResult::Comitted);
+
+        // visible at and after the commit ts
+        assert_eq!(
+            engine.read_key(commit_ts, "k"),
+            Some((commit_ts, "v1".to_string()))
+        );
+        assert_eq!(
+            engine.read_key(u64::MAX, "k"),
+            Some((commit_ts, "v1".to_string()))
+        );
+        // not visible before it
+        assert_eq!(engine.read_key(commit_ts - 1, "k"), None);
+    }
+
+    #[test]
+    fn test_snapshot_isolation_keeps_older_versions() {
+        let mut engine = StorageEngine::new();
+
+        let ts1 = engine.acquire_ts();
+        engine.commit(HashMap::new(), single_write("k", "v1", ts1));
+
+        let ts2 = engine.acquire_ts();
+        engine.commit(HashMap::new(), single_write("k", "v2", ts2));
+
+        // earlier snapshots still see the old version (COW never rewrites history)
+        assert_eq!(engine.read_key(ts1, "k"), Some((ts1, "v1".to_string())));
+        assert_eq!(engine.read_key(ts2, "k"), Some((ts2, "v2".to_string())));
+        assert_eq!(
+            engine.read_key(u64::MAX, "k"),
+            Some((ts2, "v2".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_aborted_commit_leaves_store_unchanged() {
+        let mut engine = StorageEngine::new();
+
+        let ts1 = engine.acquire_ts();
+        engine.commit(HashMap::new(), single_write("k", "v1", ts1));
+
+        // W/W conflict: commit at an older ts than what is already stored
+        let result = engine.commit(HashMap::new(), single_write("k", "stale", ts1 - 1));
+        match result {
+            OccCommitResult::Aborted(status) => {
+                assert_eq!(status.confilict_type, ConflictType::WW);
+                assert_eq!(status.key, "k");
+            }
+            OccCommitResult::Comitted => panic!("expected abort on W/W conflict"),
+        }
+
+        // the failed commit must not have leaked any partial state
+        assert_eq!(
+            engine.read_key(u64::MAX, "k"),
+            Some((ts1, "v1".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_rww_read_modify_write_conflict() {
+        let mut engine = StorageEngine::new();
+
+        let ts1 = engine.acquire_ts();
+        engine.commit(HashMap::new(), single_write("k", "v1", ts1));
+
+        // reader observed v1 at ts1, then another txn committed v2 at ts2
+        let read_ts = engine.acquire_ts();
+        let ts2 = engine.acquire_ts();
+        engine.commit(HashMap::new(), single_write("k", "v2", ts2));
+
+        // the stale reader now tries to commit a write -> must abort (R/W conflict)
+        let mut read_set = HashMap::new();
+        read_set.insert("k".to_string(), (read_ts, "v1".to_string()));
+        let result = engine.commit(read_set, single_write("k", "v1+", ts2 + 1));
+        match result {
+            OccCommitResult::Aborted(status) => assert_eq!(status.confilict_type, ConflictType::RW),
+            OccCommitResult::Comitted => panic!("expected abort on R/W conflict"),
+        }
+
+        assert_eq!(
+            engine.read_key(u64::MAX, "k"),
+            Some((ts2, "v2".to_string()))
+        );
+    }
+}
