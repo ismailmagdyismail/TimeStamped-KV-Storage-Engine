@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use tokio::{
     self,
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -17,7 +19,8 @@ async fn main() {
     // every command gets exactly one reply from the server, so send a command,
     // wait for its reply, log it and loop again
     loop {
-        // stdin closed (ctrl+d), dropping the stream closes the connection
+        print!("> ");
+        std::io::stdout().flush().unwrap();
         let line = match stdin.next_line().await.unwrap() {
             Some(line) => line,
             None => break,

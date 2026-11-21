@@ -1,17 +1,24 @@
 use std::collections::HashMap;
 
-use crate::storage::{occ_comitter::OccCommitResult, storage_engine::StorageEngine};
+use crate::storage::{
+    mvcc_control_plane::PHANTOM_TS, occ_comitter::OccCommitResult, storage_engine::StorageEngine,
+};
 
 #[derive(Debug)]
 pub struct TransactionWorkSpace<'a> {
     storage_engine: &'a StorageEngine,
     begin_ts: u64,
     // owned copies: the engine guards its store with an RwLock,
-    // so reads return owned (ts, value) pairs instead of references
+    // so reads return owned (ts_at_access, value) pairs instead of references
     read_set: HashMap<String, (u64, String)>,
-    buffered_writes: HashMap<String, String>,
-    write_set: HashMap<String, (String, u64)>,
+    write_set: HashMap<String, (u64, String)>,
 }
+
+/*
+    - For SI MVCC performs W/W validation only
+    - For SSI MVCC perorms both W/W and R/W so we can combine both read_set, write_set into 1 accessed_set
+    * BUT NOT sepeartion helps with accessing / reading you own reads, simplifies logic
+*/
 
 impl<'a> TransactionWorkSpace<'a> {
     pub fn new(storage_engine: &'a StorageEngine) -> Self {
@@ -20,26 +27,16 @@ impl<'a> TransactionWorkSpace<'a> {
             begin_ts,
             read_set: HashMap::new(),
             write_set: HashMap::new(),
-            buffered_writes: HashMap::new(),
             storage_engine,
         }
     }
 
-    /*
-    - we force non existent keys with 0 Time-Stamp
-    - to avoid some phantom problems of checking keys, then comitting
-    to find out they have been inserted with ts 0
-    - BUT THIS SHOULDN'T BE HERE
-    - a Use case discussion more than anything
-    - a transaction IFF interactive, reading non existent values is not a problem
-    - it is simply not added to R/W sets, client can chose to abort if needed
-    */
     pub fn read_key<'b>(&'b mut self, key: &str) -> Option<(&'b u64, &'b String)> {
         // A. If recent write (read your own write)
         // B. If already read / cached (avoid going to storage again)
         if self.write_set.contains_key(key) {
             let res = self.write_set.get(key).unwrap();
-            return Some((&res.1, &res.0));
+            return Some((&res.0, &res.1));
         } else if self.read_set.contains_key(key) {
             let res = self.read_set.get(key).unwrap();
             return Some((&res.0, &res.1));
@@ -54,19 +51,33 @@ impl<'a> TransactionWorkSpace<'a> {
     // stamp them with same timestamp later on commit
     // if aborted, then no need to stamp them, buffer is just cleared
     pub fn write_key(&mut self, key: String, value: String) {
-        self.buffered_writes.insert(key, value);
+        let res = self.read_key(&key);
+        let ts_at_access = if let Some((read_ts, _)) = res {
+            *read_ts
+        } else {
+            /*
+            - we force non existent keys with 0 Time-Stamp
+            - to avoid some phantom problems of checking keys, then comitting
+            to find out they have been inserted with ts_at_access 0
+            - BUT THIS SHOULDN'T BE HERE
+            - a Use case discussion more than anything
+            - a transaction IFF interactive, reading non existent values is not a problem
+            - it is simply not added to R/W sets, client can chose to abort if needed
+            IDEALLY SHOULD BE IN OCC_VALIDATION/COMITTER
+            */
+            PHANTOM_TS
+        };
+        self.write_set.insert(key, (ts_at_access, value));
     }
 
-    pub fn commit(mut self) -> OccCommitResult {
-        let commit_ts = self.storage_engine.acquire_ts();
-        for (key, val) in self.buffered_writes.into_iter() {
-            self.write_set.insert(key, (val, commit_ts));
-        }
-        self.storage_engine.commit(self.read_set, self.write_set)
+    pub fn commit(self) -> (OccCommitResult, u64) {
+        let status: (OccCommitResult, u64) =
+            self.storage_engine.commit(self.read_set, self.write_set);
+        status
     }
 
     pub fn abort(mut self) {
-        self.buffered_writes.clear();
+        self.write_set.clear();
         self.read_set.clear();
     }
 
@@ -77,7 +88,13 @@ impl<'a> TransactionWorkSpace<'a> {
 
 #[cfg(test)]
 pub mod test {
-    use std::{sync::Arc, thread};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{self, AtomicU8},
+        },
+        thread,
+    };
 
     use crate::storage::{
         occ_comitter::OccCommitResult, storage_engine::StorageEngine,
@@ -98,7 +115,7 @@ pub mod test {
                 tx.write_key(key.clone(), value);
             }
             let res = tx.commit();
-            assert_eq!(res, OccCommitResult::Comitted);
+            assert_eq!(res.0, OccCommitResult::Comitted);
         }
     }
 
@@ -113,7 +130,69 @@ pub mod test {
         let kv = tx.read_key("2");
         assert_eq!(kv, None);
         let res = tx.commit();
-        assert_eq!(res, OccCommitResult::Comitted);
+        assert_eq!(res.0, OccCommitResult::Comitted);
+    }
+
+    #[test]
+    pub fn test_read_path_prefers_buffered_writes_over_cached_and_stored_values() {
+        let storage_engine = StorageEngine::new();
+        let mut seed_tx = TransactionWorkSpace::new(&storage_engine);
+        seed_tx.write_key("key".to_string(), "stored".to_string());
+        assert_eq!(seed_tx.commit().0, OccCommitResult::Comitted);
+
+        let mut tx = TransactionWorkSpace::new(&storage_engine);
+        assert_eq!(
+            tx.read_key("key").map(|(_, value)| value.as_str()),
+            Some("stored")
+        );
+        assert_eq!(
+            tx.read_set.get("key").map(|(_, value)| value.as_str()),
+            Some("stored")
+        );
+
+        tx.write_key("key".to_string(), "buffered".to_string());
+
+        assert_eq!(
+            tx.read_key("key").map(|(_, value)| value.as_str()),
+            Some("buffered")
+        );
+        assert_eq!(
+            tx.read_set.get("key").map(|(_, value)| value.as_str()),
+            Some("stored")
+        );
+    }
+
+    #[test]
+    pub fn test_read_path_uses_cached_read_before_storage() {
+        let storage_engine = StorageEngine::new();
+        let mut tx = TransactionWorkSpace::new(&storage_engine);
+        tx.read_set
+            .insert("key".to_string(), (42, "cached".to_string()));
+
+        assert_eq!(
+            tx.read_key("key")
+                .map(|(timestamp, value)| (*timestamp, value.as_str())),
+            Some((42, "cached"))
+        );
+    }
+
+    #[test]
+    pub fn test_read_path_loads_from_storage_and_caches_result() {
+        let storage_engine = StorageEngine::new();
+        let mut seed_tx = TransactionWorkSpace::new(&storage_engine);
+        seed_tx.write_key("key".to_string(), "stored".to_string());
+        assert_eq!(seed_tx.commit().0, OccCommitResult::Comitted);
+
+        let mut tx = TransactionWorkSpace::new(&storage_engine);
+        let stored_read = tx
+            .read_key("key")
+            .map(|(timestamp, value)| (*timestamp, value.clone()));
+
+        assert_eq!(
+            stored_read.as_ref().map(|(_, value)| value.as_str()),
+            Some("stored")
+        );
+        assert_eq!(tx.read_set.get("key"), stored_read.as_ref());
     }
 
     #[test]
@@ -136,7 +215,7 @@ pub mod test {
             assert_ne!(res, None);
         }
         let res = tx.commit();
-        assert_eq!(res, OccCommitResult::Comitted);
+        assert_eq!(res.0, OccCommitResult::Comitted);
     }
 
     #[test]
@@ -174,8 +253,8 @@ pub mod test {
         tx2.write_key("3".to_string(), "updated_3".to_string());
         tx2.write_key("4".to_string(), "updared_4".to_string());
 
-        assert_eq!(tx1.commit(), OccCommitResult::Comitted);
-        assert_eq!(tx2.commit(), OccCommitResult::Comitted);
+        assert_eq!(tx1.commit().0, OccCommitResult::Comitted);
+        assert_eq!(tx2.commit().0, OccCommitResult::Comitted);
     }
 
     #[test]
@@ -207,8 +286,8 @@ pub mod test {
         tx2.write_key("5".to_string(), "updated_3".to_string());
         tx2.write_key("6".to_string(), "updared_4".to_string());
 
-        assert_eq!(tx1.commit(), OccCommitResult::Comitted);
-        assert_eq!(tx2.commit(), OccCommitResult::Comitted);
+        assert_eq!(tx1.commit().0, OccCommitResult::Comitted);
+        assert_eq!(tx2.commit().0, OccCommitResult::Comitted);
     }
 
     #[test]
@@ -239,7 +318,7 @@ pub mod test {
             let mut write_tx = TransactionWorkSpace::new(&storage_engine);
             write_tx.write_key(i.to_string(), new_write_value.to_string());
             let res = write_tx.commit();
-            assert_eq!(res, OccCommitResult::Comitted);
+            assert_eq!(res.0, OccCommitResult::Comitted);
         }
 
         for i in 1..num_records + 1 {
@@ -279,7 +358,7 @@ pub mod test {
             let mut write_tx = TransactionWorkSpace::new(&storage_engine);
             write_tx.write_key(i.to_string(), new_write_value.to_string());
             let res = write_tx.commit();
-            assert_eq!(res, OccCommitResult::Comitted);
+            assert_eq!(res.0, OccCommitResult::Comitted);
         }
 
         for i in 1..existing_records_end {
@@ -324,9 +403,9 @@ pub mod test {
         tx2.write_key("2".to_string(), "new".to_string());
 
         let res = tx1.commit();
-        assert_eq!(res, OccCommitResult::Comitted);
+        assert_eq!(res.0, OccCommitResult::Comitted);
         let res = tx2.commit();
-        assert_ne!(res, OccCommitResult::Comitted);
+        assert_ne!(res.0, OccCommitResult::Comitted);
     }
 
     #[test]
@@ -353,12 +432,26 @@ pub mod test {
                 tx.read_key(&i.to_string());
                 tx.write_key(i.to_string(), "new".to_string());
                 let res = tx.commit();
-                assert_eq!(res, OccCommitResult::Comitted);
+                assert_eq!(res.0, OccCommitResult::Comitted);
             });
             threads.push(handle);
         }
         for thread in threads {
             thread.join().unwrap();
         }
+    }
+
+    #[test]
+    pub fn test_write_phantoms() {
+        let storage_engine = Arc::new(StorageEngine::new());
+        let mut tx1 = TransactionWorkSpace::new(&storage_engine);
+        let mut tx2 = TransactionWorkSpace::new(&storage_engine);
+        tx1.write_key("key".to_string(), "value".to_string());
+        tx2.write_key("key".to_string(), "value".to_string());
+
+        let (res, _) = tx1.commit();
+        assert_eq!(res, OccCommitResult::Comitted);
+        let (res, _) = tx2.commit();
+        assert_ne!(res, OccCommitResult::Comitted);
     }
 }

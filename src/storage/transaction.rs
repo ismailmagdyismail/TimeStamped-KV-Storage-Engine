@@ -22,7 +22,7 @@ impl<'a> Transaction<'a> {
         self.workspace.write_key(key, value);
     }
 
-    pub fn commit(self) -> OccCommitResult {
+    pub fn commit(self) -> (OccCommitResult, u64) {
         self.workspace.commit()
     }
 

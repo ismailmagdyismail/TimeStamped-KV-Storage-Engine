@@ -93,13 +93,14 @@ async fn handle_command<'a>(
                 return Some(transaction);
             }
             let begin_ts = transaction.begin_timestamp();
-            match transaction.commit() {
+            let (status, commit_ts) = transaction.commit();
+            match status {
                 OccCommitResult::Comitted => {
                     stream
                         .write_all(
                             format!(
-                                "transaction with begin ts {}, committed successfully",
-                                begin_ts
+                                "transaction with begin ts {}, committed successfully at ts {}",
+                                begin_ts, commit_ts
                             )
                             .as_bytes(),
                         )
