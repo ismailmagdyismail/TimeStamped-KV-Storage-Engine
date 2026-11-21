@@ -72,7 +72,13 @@ async fn handle_command<'a>(
             }
             let key = String::from_utf8(splitted_command[1].to_owned()).unwrap();
             let value = String::from_utf8(splitted_command[2].to_owned()).unwrap();
+            let ack = format!(
+                "put acknowledged, key {} buffered in transaction with begin ts {}",
+                key,
+                transaction.begin_timestamp()
+            );
             transaction.put(key, value);
+            stream.write_all(ack.as_bytes()).await.unwrap();
         }
         b"commit" => {
             if splitted_command.len() != 1 {
@@ -126,7 +132,12 @@ async fn handle_command<'a>(
                     .unwrap();
                 return Some(transaction);
             }
+            let begin_ts = transaction.begin_timestamp();
             transaction.abort();
+            stream
+                .write_all(format!("transaction with begin ts {}, aborted", begin_ts).as_bytes())
+                .await
+                .unwrap();
             // abort consumed the transaction
             return None;
         }
