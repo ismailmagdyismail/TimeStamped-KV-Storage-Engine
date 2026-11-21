@@ -16,10 +16,10 @@ use crate::storage::{
 */
 
 /* OCC, MVCC
-    - Core Steps Ideally 
-        1. Access 
+    - Core Steps Ideally
+        1. Access
             - Lock-Free N Readers, N Writers
-        2. Validation 
+        2. Validation
             - Readers progressing with 1 Writer concurrently
         3. Publication after validation
             - Lock-Free (N Readers, 1 Writer)
@@ -148,14 +148,9 @@ impl StorageEngine {
 
         // 2. Validate + apply against the private copy (OCC).
         //    The committer borrows the read set, so adapt the owned read set to references.
-        let read_set_refs = read_set
-            .iter()
-            .map(|(key, (ts, value))| (key.clone(), (ts, value)))
-            .collect();
-
-        let commit_result =
-            self.committer
-                .commit(&mut local_copied_storage, read_set_refs, write_set);
+        let commit_result = self
+            .committer
+            .commit(&mut local_copied_storage, read_set, write_set);
 
         match commit_result {
             // [Not with accordance to OCC, MVCC]

@@ -33,7 +33,7 @@ impl OccCommitter {
     pub fn commit<'a>(
         &mut self,
         versioned_storage: &mut VersionedStore,
-        read_set: HashMap<String, (&'a u64, &'a String)>,
+        read_set: HashMap<String, (u64, String)>,
         write_set: HashMap<String, (String, u64)>,
     ) -> OccCommitResult {
         // Write Skew Handling -- Detect R/W conflicts, not just W/W conflicts
@@ -73,13 +73,13 @@ impl OccCommitter {
         // R/W validation
         for (key, (ts, val)) in read_set {
             if let Some(stored_ts) = versioned_storage.get_max_timestamp_for_record(&key) {
-                if stored_ts >= ts && !tx_is_read_only {
+                if *stored_ts >= ts && !tx_is_read_only {
                     return OccCommitResult::Aborted(AbortStatus {
                         confilict_type: ConflictType::RW,
                         key: key.clone(),
                         value: val.to_string(),
                         stored_ts: *stored_ts,
-                        ts_to_commit: *ts,
+                        ts_to_commit: ts,
                     });
                 }
             }
@@ -90,7 +90,7 @@ impl OccCommitter {
                     key: key.clone(),
                     value: val.clone(),
                     stored_ts: 0,
-                    ts_to_commit: *ts,
+                    ts_to_commit: ts,
                 });
             }
         }
@@ -122,7 +122,7 @@ mod test {
 
         // reads
         let mut read_set = HashMap::new();
-        read_set.insert(key, (&ts, &val));
+        read_set.insert(key, (ts, val));
 
         let write_set = HashMap::new();
 
@@ -163,8 +163,8 @@ mod test {
         let val = "1".to_string();
         let ts = 1;
 
-        let mut read_set: HashMap<String, (&u64, &String)> = HashMap::new();
-        read_set.insert(key, (&ts, &val));
+        let mut read_set = HashMap::new();
+        read_set.insert(key, (ts, val));
 
         let write_set = HashMap::new();
 
@@ -182,8 +182,8 @@ mod test {
         let val = "1".to_string();
         let ts = 1;
 
-        let mut read_set: HashMap<String, (&u64, &String)> = HashMap::new();
-        read_set.insert(key, (&ts, &val));
+        let mut read_set = HashMap::new();
+        read_set.insert(key, (ts, val));
 
         let mut write_set: HashMap<String, (String, u64)> = HashMap::new();
         write_set.insert("11".to_string(), ("11".to_string(), 11));
@@ -212,9 +212,9 @@ mod test {
         let key2_t1 = "2".to_string();
         let val2_t1 = "2".to_string();
         {
-            let mut read_set: HashMap<String, (&u64, &String)> = HashMap::new();
-            read_set.insert(key1_t1.clone(), (&tx_1_r_ts, &val1_t1));
-            read_set.insert(key2_t1.clone(), (&tx_1_r_ts, &val2_t1));
+            let mut read_set = HashMap::new();
+            read_set.insert(key1_t1.clone(), (tx_1_r_ts, val1_t1));
+            read_set.insert(key2_t1.clone(), (tx_1_r_ts, val2_t1));
 
             let mut write_set: HashMap<String, (String, u64)> = HashMap::new();
             write_set.insert(key1_t1, ("0".to_string(), tx_1_w_ts));
@@ -231,9 +231,9 @@ mod test {
             let key2 = "2".to_string();
             let val2 = "2".to_string();
 
-            let mut read_set: HashMap<String, (&u64, &String)> = HashMap::new();
-            read_set.insert(key1.clone(), (&tx_2_r_ts, &val1));
-            read_set.insert(key2.clone(), (&tx_2_r_ts, &val2));
+            let mut read_set = HashMap::new();
+            read_set.insert(key1.clone(), (tx_2_r_ts, val1));
+            read_set.insert(key2.clone(), (tx_2_r_ts, val2));
 
             let mut write_set: HashMap<String, (String, u64)> = HashMap::new();
             write_set.insert(key2, ("0".to_string(), tx_2_w_ts));
