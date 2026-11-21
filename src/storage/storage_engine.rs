@@ -1,6 +1,7 @@
+use arc_swap::ArcSwap;
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex},
 };
 
 use crate::storage::{
@@ -75,24 +76,21 @@ pub struct StorageEngine {
     - kept temporarily: readers take the read lock and clone the Arc snapshot,
       writers publish a brand new Arc under the write lock (COW, never mutate in place)
     */
-    versioned_storage: RwLock<Arc<VersionedStore>>,
+    versioned_storage: ArcSwap<VersionedStore>, // lock-free reads, atomic publish
 
     // Serializes commit validation + application + publication.
-    commit_mutex: Mutex<()>,
-
-    committer: OccCommitter,
+    committer: Mutex<OccCommitter>,
 }
 
 impl StorageEngine {
     pub fn new() -> Self {
         let committer = OccCommitter::new();
-        let versioned_storage = RwLock::new(Arc::new(VersionedStore::new()));
+        let versioned_storage = ArcSwap::from_pointee(VersionedStore::new());
         let mvcc_control_plane = MVCCControlPlane::new();
         Self {
             versioned_storage,
-            committer,
+            committer: Mutex::new(committer),
             mvcc_control_plane,
-            commit_mutex: Mutex::new(()),
         }
     }
 
@@ -108,21 +106,21 @@ impl StorageEngine {
         - owned (ts, value) is returned instead of references, because
           references cannot outlive the RwLock read guard
         */
-        let storage_snapshot = self.versioned_storage.read().unwrap();
-        storage_snapshot
+        let snapshot = self.versioned_storage.load();
+        snapshot
             .get_at_or_before_ts(key, ts)
-            .map(|(stored_ts, value)| (*stored_ts, value.clone()))
+            .map(|(stored_ts, v)| (*stored_ts, v.clone()))
     }
 
     pub fn commit(
-        &mut self,
+        &self,
         read_set: HashMap<String, (u64, String)>,
         write_set: HashMap<String, (String, u64)>,
     ) -> OccCommitResult {
         // Global commit point: only one writer validates + applies + publishes at a time,
         // so validation can never observe a store that changed underneath it.
         // Only 1 Writer is proceeding at this point (according to OCC)
-        let _commit_guard = self.commit_mutex.lock().unwrap();
+        let mut committer = self.committer.lock().unwrap();
 
         /*
         - Copying the whole storage heavy to do, especially during critical path
@@ -135,22 +133,16 @@ impl StorageEngine {
 
         // 1. Snapshot the currently published store (cheap Arc clone under the read lock),
         //    then deep-copy it so validation/application happen off the published store.
-        let published_snapshot = {
-            let storage_guard = self.versioned_storage.read().unwrap();
-            storage_guard.clone()
-        };
 
         // [Not with accordance to OCC, MVCC]
         // Should be updated with atomic chain updates (kinda liked linked list ptr updates)
         // instead of a whole deep copy
         // this is to avoid Readers obersving corrupted VerionsedStore (being rebalanced / or chains updated)
-        let mut local_copied_storage = (*published_snapshot).clone();
+        let mut local_copied_storage = (**self.versioned_storage.load()).clone();
 
         // 2. Validate + apply against the private copy (OCC).
         //    The committer borrows the read set, so adapt the owned read set to references.
-        let commit_result = self
-            .committer
-            .commit(&mut local_copied_storage, read_set, write_set);
+        let commit_result = committer.commit(&mut local_copied_storage, read_set, write_set);
 
         match commit_result {
             // [Not with accordance to OCC, MVCC]
@@ -159,8 +151,7 @@ impl StorageEngine {
             // 3. Publish: atomically swap the new store in under the write lock.
             //    Readers holding the old Arc keep reading their consistent snapshot.
             OccCommitResult::Comitted => {
-                let mut storage_guard = self.versioned_storage.write().unwrap();
-                *storage_guard = Arc::new(local_copied_storage);
+                self.versioned_storage.store(Arc::new(local_copied_storage));
                 OccCommitResult::Comitted
             }
             // Aborted: the private copy is dropped, published store stays untouched.
@@ -192,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_commit_publishes_version() {
-        let mut engine = StorageEngine::new();
+        let engine = StorageEngine::new();
         let commit_ts = engine.acquire_ts();
 
         let result: OccCommitResult =
@@ -214,7 +205,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_isolation_keeps_older_versions() {
-        let mut engine = StorageEngine::new();
+        let engine = StorageEngine::new();
 
         let ts1 = engine.acquire_ts();
         engine.commit(HashMap::new(), single_write("k", "v1", ts1));
@@ -233,7 +224,7 @@ mod tests {
 
     #[test]
     fn test_aborted_commit_leaves_store_unchanged() {
-        let mut engine = StorageEngine::new();
+        let engine = StorageEngine::new();
 
         let ts1 = engine.acquire_ts();
         engine.commit(HashMap::new(), single_write("k", "v1", ts1));
@@ -257,7 +248,7 @@ mod tests {
 
     #[test]
     fn test_rww_read_modify_write_conflict() {
-        let mut engine = StorageEngine::new();
+        let engine = StorageEngine::new();
 
         let ts1 = engine.acquire_ts();
         engine.commit(HashMap::new(), single_write("k", "v1", ts1));
