@@ -23,3 +23,9 @@ The test suite demonstrates snapshot reads, conflicts, write skew, phantom write
 ```sh
 cargo test
 ```
+
+## TODO
+```
+Not fully serializable: reads of absent keys are never recorded. So "if neither X nor Y exists, create one" lets both transactions read the missing keys and insert different keys. The write-set check only compares each key against itself, so both commit. That is write skew through phantoms.
+needs to records missing reads not just discard them
+```
