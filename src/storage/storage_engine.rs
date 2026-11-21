@@ -162,7 +162,14 @@ impl StorageEngine {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+    };
 
     use crate::storage::{
         occ_comitter::{ConflictType, OccCommitResult},
@@ -271,5 +278,79 @@ mod tests {
             engine.read_key(u64::MAX, "k"),
             Some((ts2, "v2".to_string()))
         );
+    }
+
+    #[test]
+    fn test_concurrent_commits_no_conflicts() {
+        let engine = Arc::new(StorageEngine::new());
+        const THREADS: usize = 8;
+        const ITERS: usize = 100;
+
+        {
+            let ts = engine.acquire_ts();
+            let result = engine.commit(HashMap::new(), single_write("counter", "0", ts));
+            assert_eq!(result, OccCommitResult::Comitted);
+        }
+
+        let mut handles = Vec::new();
+        for id in 0..THREADS {
+            let engine_clone = Arc::clone(&engine);
+            handles.push(thread::spawn(move || {
+                for i in 0..ITERS {
+                    let unique_key =
+                        format!("counter_threadid_iteration_id_{}_{:?}", id, i.to_string());
+                    let result = engine_clone.commit(
+                        HashMap::new(),
+                        single_write(&unique_key, &i.to_string(), engine_clone.acquire_ts()),
+                    );
+                    assert_eq!(result, OccCommitResult::Comitted);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_concurrent_readers_never_see_versions_from_the_future() {
+        let engine = Arc::new(StorageEngine::new());
+        {
+            let ts = engine.acquire_ts();
+            engine.commit(HashMap::new(), single_write("hot", "seed", ts));
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let stop = Arc::clone(&stop);
+            let reader_engine_ref = Arc::clone(&engine);
+            readers.push(thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let r_ts = reader_engine_ref.acquire_ts();
+                    if let Some((stored_ts, _)) = reader_engine_ref.read_key(r_ts, "hot") {
+                        assert!(
+                            stored_ts <= r_ts,
+                            "reader at ts {r_ts} saw version from ts {stored_ts}"
+                        );
+                    }
+                }
+            }));
+        }
+
+        // writer: publish many new versions while readers are scanning
+        {
+            for i in 0..200 {
+                let ts = engine.acquire_ts();
+                let result =
+                    engine.commit(HashMap::new(), single_write("hot", &format!("w{i}"), ts));
+                assert_eq!(result, OccCommitResult::Comitted);
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            r.join().unwrap();
+        }
     }
 }
