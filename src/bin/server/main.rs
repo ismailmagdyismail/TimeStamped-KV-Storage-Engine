@@ -10,10 +10,10 @@ use tokio::{
 };
 
 async fn handle_command<'a>(
-    mut stream: TcpStream,
+    stream: &mut TcpStream,
     buffer: &[u8],
     mut transaction: Transaction<'a>,
-) {
+) -> Option<Transaction<'a>> {
     let splitted_command: Vec<&[u8]> = buffer.split(|byte| *byte == b' ').collect();
     if splitted_command.len() < 1 {
         stream
@@ -24,7 +24,7 @@ async fn handle_command<'a>(
             )
             .await
             .unwrap();
-        return;
+        return Some(transaction);
     }
     let command_name = splitted_command[0];
     let command_name = command_name.to_ascii_lowercase();
@@ -40,7 +40,7 @@ async fn handle_command<'a>(
                     )
                     .await
                     .unwrap();
-                return;
+                return Some(transaction);
             }
             let key = String::from_utf8(splitted_command[1].to_owned()).unwrap();
             match transaction.get(&key) {
@@ -68,7 +68,7 @@ async fn handle_command<'a>(
                     )
                     .await
                     .unwrap();
-                return;
+                return Some(transaction);
             }
             let key = String::from_utf8(splitted_command[1].to_owned()).unwrap();
             let value = String::from_utf8(splitted_command[2].to_owned()).unwrap();
@@ -84,7 +84,7 @@ async fn handle_command<'a>(
                     )
                     .await
                     .unwrap();
-                return;
+                return Some(transaction);
             }
             let begin_ts = transaction.begin_timestamp();
             match transaction.commit() {
@@ -111,6 +111,8 @@ async fn handle_command<'a>(
                     stream.write_all(message.as_bytes()).await.unwrap();
                 }
             }
+            // commit consumed the transaction
+            return None;
         }
         b"abort" => {
             if splitted_command.len() != 1 {
@@ -122,9 +124,11 @@ async fn handle_command<'a>(
                     )
                     .await
                     .unwrap();
-                return;
+                return Some(transaction);
             }
             transaction.abort();
+            // abort consumed the transaction
+            return None;
         }
         _ => {
             stream
@@ -133,17 +137,32 @@ async fn handle_command<'a>(
                 .unwrap();
         }
     }
+    Some(transaction)
 }
 
-pub async fn handle_connection<'a>(mut stream: TcpStream, transaction: Transaction<'a>) {
+pub async fn handle_connection<'a>(
+    mut stream: TcpStream,
+    storage: &'a MVCCStorageEngine,
+    mut transaction: Transaction<'a>,
+) {
     let mut buffer = [b'0'; 1024];
-    let result = stream.read(&mut buffer).await;
-    match result {
-        Ok(bytes) => {
-            handle_command(stream, &buffer[0..bytes], transaction).await;
-        }
-        Err(err) => {
-            eprint!("error when recieving bytes {}", err.to_string())
+    loop {
+        let result = stream.read(&mut buffer).await;
+        match result {
+            // client closed the connection
+            Ok(0) => break,
+            Ok(bytes) => {
+                transaction =
+                    match handle_command(&mut stream, &buffer[0..bytes], transaction).await {
+                        Some(transaction) => transaction,
+                        // previous transaction was committed/aborted, start a new one
+                        None => storage.begin_transaction(),
+                    };
+            }
+            Err(err) => {
+                eprint!("error when recieving bytes {}", err.to_string());
+                break;
+            }
         }
     }
 }
@@ -158,7 +177,7 @@ async fn main() {
         let clone = Arc::clone(&storage);
         tokio::spawn(async move {
             let tx = clone.begin_transaction();
-            handle_connection(stream, tx).await;
+            handle_connection(stream, &clone, tx).await;
         });
     }
 }
