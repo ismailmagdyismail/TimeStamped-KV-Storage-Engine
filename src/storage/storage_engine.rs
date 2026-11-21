@@ -116,13 +116,13 @@ impl StorageEngine {
     pub fn commit(
         &self,
         read_set: HashMap<String, (u64, String)>,
-        write_set: HashMap<String, (String, u64)>,
-    ) -> OccCommitResult {
+        write_set: HashMap<String, (u64, String)>,
+    ) -> (OccCommitResult, u64) {
         // Global commit point: only one writer validates + applies + publishes at a time,
         // so validation can never observe a store that changed underneath it.
         // Only 1 Writer is proceeding at this point (according to OCC)
         let mut committer = self.committer.lock().unwrap();
-
+        let commit_ts = self.mvcc_control_plane.acquire_ts();
         /*
         - Copying the whole storage heavy to do, especially during critical path
             * We need it to avoid modifying BTrees/Maps in Place while being accessed by readers causing races
@@ -143,7 +143,8 @@ impl StorageEngine {
 
         // 2. Validate + apply against the private copy (OCC).
         //    The committer borrows the read set, so adapt the owned read set to references.
-        let commit_result = committer.commit(&mut local_copied_storage, read_set, write_set);
+        let commit_result =
+            committer.commit(&mut local_copied_storage, read_set, write_set, commit_ts);
 
         match commit_result {
             // [Not with accordance to OCC, MVCC]
@@ -153,10 +154,10 @@ impl StorageEngine {
             //    Readers holding the old Arc keep reading their consistent snapshot.
             OccCommitResult::Comitted => {
                 self.versioned_storage.store(Arc::new(local_copied_storage));
-                OccCommitResult::Comitted
+                (OccCommitResult::Comitted, commit_ts)
             }
             // Aborted: the private copy is dropped, published store stays untouched.
-            _ => commit_result,
+            _ => (commit_result, commit_ts),
         }
     }
 }
@@ -173,13 +174,14 @@ mod tests {
     };
 
     use crate::storage::{
+        mvcc_control_plane::PHANTOM_TS,
         occ_comitter::{ConflictType, OccCommitResult},
         storage_engine::StorageEngine,
     };
 
-    fn single_write(key: &str, value: &str, ts: u64) -> HashMap<String, (String, u64)> {
+    fn single_write(key: &str, value: &str, ts: u64) -> HashMap<String, (u64, String)> {
         let mut write_set = HashMap::new();
-        write_set.insert(key.to_string(), (value.to_string(), ts));
+        write_set.insert(key.to_string(), (ts, value.to_string()));
         write_set
     }
 
@@ -192,10 +194,9 @@ mod tests {
     #[test]
     fn test_commit_publishes_version() {
         let engine = StorageEngine::new();
-        let commit_ts = engine.acquire_ts();
+        let snapshot = engine.acquire_ts();
 
-        let result: OccCommitResult =
-            engine.commit(HashMap::new(), single_write("k", "v1", commit_ts));
+        let (result, commit_ts) = engine.commit(HashMap::new(), single_write("k", "v1", snapshot));
         assert_eq!(result, OccCommitResult::Comitted);
 
         // visible at and after the commit ts
@@ -215,18 +216,28 @@ mod tests {
     fn test_snapshot_isolation_keeps_older_versions() {
         let engine = StorageEngine::new();
 
-        let ts1 = engine.acquire_ts();
-        engine.commit(HashMap::new(), single_write("k", "v1", ts1));
+        let snapshot_1 = engine.acquire_ts();
+        let (res_1, commit_ts_1) =
+            engine.commit(HashMap::new(), single_write("k", "v1", snapshot_1));
+        assert_eq!(res_1, OccCommitResult::Comitted);
 
-        let ts2 = engine.acquire_ts();
-        engine.commit(HashMap::new(), single_write("k", "v2", ts2));
+        let snapshot_2 = engine.acquire_ts();
+        let (res_2, commit_ts_2) =
+            engine.commit(HashMap::new(), single_write("k", "v2", snapshot_2));
+        assert_eq!(res_2, OccCommitResult::Comitted);
 
         // earlier snapshots still see the old version (COW never rewrites history)
-        assert_eq!(engine.read_key(ts1, "k"), Some((ts1, "v1".to_string())));
-        assert_eq!(engine.read_key(ts2, "k"), Some((ts2, "v2".to_string())));
+        assert_eq!(
+            engine.read_key(commit_ts_1, "k"),
+            Some((commit_ts_1, "v1".to_string()))
+        );
+        assert_eq!(
+            engine.read_key(commit_ts_2, "k"),
+            Some((commit_ts_2, "v2".to_string()))
+        );
         assert_eq!(
             engine.read_key(u64::MAX, "k"),
-            Some((ts2, "v2".to_string()))
+            Some((commit_ts_2, "v2".to_string()))
         );
     }
 
@@ -234,12 +245,15 @@ mod tests {
     fn test_aborted_commit_leaves_store_unchanged() {
         let engine = StorageEngine::new();
 
-        let ts1 = engine.acquire_ts();
-        engine.commit(HashMap::new(), single_write("k", "v1", ts1));
+        let snapshot_ts = PHANTOM_TS;
+        let (res_1, commit_1_ts) =
+            engine.commit(HashMap::new(), single_write("k", "v1", snapshot_ts));
+        assert_eq!(res_1, OccCommitResult::Comitted);
 
         // W/W conflict: commit at an older ts than what is already stored
-        let result = engine.commit(HashMap::new(), single_write("k", "stale", ts1 - 1));
-        match result {
+        let (res_2, commit_2_ts) =
+            engine.commit(HashMap::new(), single_write("k", "stale", snapshot_ts));
+        match res_2 {
             OccCommitResult::Aborted(status) => {
                 assert_eq!(status.confilict_type, ConflictType::WW);
                 assert_eq!(status.key, "k");
@@ -249,8 +263,8 @@ mod tests {
 
         // the failed commit must not have leaked any partial state
         assert_eq!(
-            engine.read_key(u64::MAX, "k"),
-            Some((ts1, "v1".to_string()))
+            engine.read_key(commit_2_ts, "k"),
+            Some((commit_1_ts, "v1".to_string()))
         );
     }
 
@@ -258,26 +272,24 @@ mod tests {
     fn test_rww_read_modify_write_conflict() {
         let engine = StorageEngine::new();
 
-        let ts1 = engine.acquire_ts();
-        engine.commit(HashMap::new(), single_write("k", "v1", ts1));
+        let snapshot_ts = engine.acquire_ts();
 
-        // reader observed v1 at ts1, then another txn committed v2 at ts2
-        let read_ts = engine.acquire_ts();
-        let ts2 = engine.acquire_ts();
-        engine.commit(HashMap::new(), single_write("k", "v2", ts2));
+        let (res1, commit_ts_1) =
+            engine.commit(HashMap::new(), single_write("k", "v1", snapshot_ts));
+        assert_eq!(res1, OccCommitResult::Comitted);
 
         // the stale reader now tries to commit a write -> must abort (R/W conflict)
         let mut read_set = HashMap::new();
-        read_set.insert("k".to_string(), (read_ts, "v1".to_string()));
-        let result = engine.commit(read_set, single_write("k", "v1+", ts2 + 1));
+        read_set.insert("k".to_string(), (snapshot_ts, "v2".to_string()));
+        let (result, _) = engine.commit(read_set, single_write("k", "v1+", snapshot_ts));
         match result {
-            OccCommitResult::Aborted(status) => assert_eq!(status.confilict_type, ConflictType::RW),
+            OccCommitResult::Aborted(status) => assert_eq!(status.confilict_type, ConflictType::WW),
             OccCommitResult::Comitted => panic!("expected abort on R/W conflict"),
         }
 
         assert_eq!(
             engine.read_key(u64::MAX, "k"),
-            Some((ts2, "v2".to_string()))
+            Some((commit_ts_1, "v1".to_string()))
         );
     }
 
@@ -286,10 +298,11 @@ mod tests {
         let engine = Arc::new(StorageEngine::new());
         const THREADS: usize = 8;
         const ITERS: usize = 100;
+        let snapshot_ts = engine.acquire_ts();
 
         {
-            let ts = engine.acquire_ts();
-            let result = engine.commit(HashMap::new(), single_write("counter", "0", ts));
+            let (result, _) =
+                engine.commit(HashMap::new(), single_write("counter", "0", snapshot_ts));
             assert_eq!(result, OccCommitResult::Comitted);
         }
 
@@ -300,9 +313,9 @@ mod tests {
                 for i in 0..ITERS {
                     let unique_key =
                         format!("counter_threadid_iteration_id_{}_{:?}", id, i.to_string());
-                    let result = engine_clone.commit(
+                    let (result, _) = engine_clone.commit(
                         HashMap::new(),
-                        single_write(&unique_key, &i.to_string(), engine_clone.acquire_ts()),
+                        single_write(&unique_key, &i.to_string(), snapshot_ts),
                     );
                     assert_eq!(result, OccCommitResult::Comitted);
                 }
@@ -316,9 +329,9 @@ mod tests {
     #[test]
     fn test_concurrent_readers_never_see_versions_from_the_future() {
         let engine = Arc::new(StorageEngine::new());
+        let snapshot_ts = engine.acquire_ts();
         {
-            let ts = engine.acquire_ts();
-            engine.commit(HashMap::new(), single_write("hot", "seed", ts));
+            engine.commit(HashMap::new(), single_write("hot", "seed", snapshot_ts));
         }
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -328,11 +341,10 @@ mod tests {
             let reader_engine_ref = Arc::clone(&engine);
             readers.push(thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    let r_ts = reader_engine_ref.acquire_ts();
-                    if let Some((stored_ts, _)) = reader_engine_ref.read_key(r_ts, "hot") {
+                    if let Some((stored_ts, _)) = reader_engine_ref.read_key(snapshot_ts, "hot") {
                         assert!(
-                            stored_ts <= r_ts,
-                            "reader at ts {r_ts} saw version from ts {stored_ts}"
+                            stored_ts <= snapshot_ts,
+                            "reader at ts {snapshot_ts} saw version from ts {stored_ts}"
                         );
                     }
                 }
@@ -343,7 +355,7 @@ mod tests {
         {
             for i in 0..200 {
                 let ts = engine.acquire_ts();
-                let result =
+                let (result, _) =
                     engine.commit(HashMap::new(), single_write("hot", &format!("w{i}"), ts));
                 assert_eq!(result, OccCommitResult::Comitted);
             }

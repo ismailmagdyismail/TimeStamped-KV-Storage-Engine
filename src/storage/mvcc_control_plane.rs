@@ -1,5 +1,7 @@
 use std::sync::atomic;
 
+pub const PHANTOM_TS: u64 = 0;
+
 #[derive(Debug)]
 pub struct MVCCControlPlane {
     current_ts: atomic::AtomicU64,
