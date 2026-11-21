@@ -5,6 +5,24 @@ pub struct VersionedStore {
     store: HashMap<String, BTreeMap<u64, String>>,
 }
 
+/*
+    Ideally to avoid
+        - Locking
+        - Deep Copy + COW
+        - we granulize the COW to be per key, per verision, instead of per VersionedStore
+            to avoid the huge INCREASING cost of deep copy as store grows in size
+            keeping COW | CAS | Shadow Copying at Chain Node Level Keeps cost constant regardless of store size
+
+            -----> Key_A-Chain  => [ (ts_1, Value, atomic_next) , (ts_2, Value, atomic_next) , (ts_3, Value, atomic_next) ]
+          |
+          |
+    Index |----> Key_B-Chain => [ (ts_1, Value, atomic_next) , (ts_2, Value, atomic_next) ]
+    (COW) |
+          |
+          |----> Key_C-Chain => [ (ts_1, Value, atomic_next) , (ts_2, Value, atomic_next) ]
+
+*/
+
 impl VersionedStore {
     pub fn new() -> Self {
         VersionedStore {

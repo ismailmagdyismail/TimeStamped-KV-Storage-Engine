@@ -67,6 +67,7 @@ use crate::storage::{
                 - R/W Lock instead of atomic ptr swap
 */
 
+#[derive(Debug)]
 pub struct StorageEngine {
     mvcc_control_plane: MVCCControlPlane,
     /*

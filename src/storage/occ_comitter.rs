@@ -73,7 +73,7 @@ impl OccCommitter {
         // R/W validation
         for (key, (ts, val)) in read_set {
             if let Some(stored_ts) = versioned_storage.get_max_timestamp_for_record(&key) {
-                if *stored_ts >= ts && !tx_is_read_only {
+                if *stored_ts >= ts {
                     return OccCommitResult::Aborted(AbortStatus {
                         confilict_type: ConflictType::RW,
                         key: key.clone(),
