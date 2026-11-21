@@ -14,11 +14,11 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    pub fn read_key<'b>(&'b mut self, key: &str) -> Option<(&'b u64, &'b String)> {
+    pub fn get<'b>(&'b mut self, key: &str) -> Option<(&'b u64, &'b String)> {
         self.workspace.read_key(key)
     }
 
-    pub fn write_key(&mut self, key: String, value: String) {
+    pub fn put(&mut self, key: String, value: String) {
         self.workspace.write_key(key, value);
     }
 
